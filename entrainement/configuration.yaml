@@ -1,0 +1,13 @@
+# Paramètres d'entraînement
+training_samples: 100000
+test_size: 0.15
+n_estimators: 300
+max_depth: 15
+min_samples_split: 5
+class_weights:
+  no_action: 1
+  switch_ap: 2
+  block_user: 3
+  throttle: 2
+  load_balance: 1.5
+  qos_adjust: 2
