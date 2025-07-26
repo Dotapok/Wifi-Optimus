@@ -1,216 +1,265 @@
+import os
 from flask import Flask, request, jsonify
-from flasgger import Swagger
+from flasgger import Swagger, swag_from
 import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import yaml
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from datetime import datetime
+import logging
+from logging.handlers import RotatingFileHandler
+from dotenv import load_dotenv
+import secrets
 
-# Configuration initiale
-CONFIG = {
-    'MODEL_DIR': Path('/app/model'),
-    'CONFIG_PATH': Path('/app/config/config.yaml'),
-    'LOG_DIR': Path('/app/logs')
-}
+# Chargement des variables d'environnement
+load_dotenv()
 
-# Création des répertoires nécessaires
-for directory in CONFIG.values():
-    directory.mkdir(parents=True, exist_ok=True)
+# Configuration sécurisée
+class Config:
+    MODEL_DIR = Path(os.getenv('MODEL_DIR', '/app/modeles'))
+    CONFIG_PATH = Path(os.getenv('CONFIG_PATH', '/app/config/config.yaml'))
+    LOG_DIR = Path(os.getenv('LOG_DIR', '/app/logs'))
+    SECRET_KEY = os.getenv('SECRET_KEY', secrets.token_hex(32))
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max payload
+    MODEL_FILE = 'optimus1.joblib'
+    
+    # Création des répertoires
+    for directory in [MODEL_DIR, CONFIG_PATH.parent, LOG_DIR]:
+        directory.mkdir(parents=True, exist_ok=True)
 
+# Initialisation Flask
 app = Flask(__name__)
-app.config['SWAGGER'] = {
-    'title': 'API WiFi Optimus - Système Intelligent de Gestion Réseau',
-    'uiversion': 3,
-    'specs_route': '/docs/',
-    'description': """
-    API d'inférence pour le système intelligent de gestion des réseaux WiFi.
-    Ce système utilise un modèle ML pour optimiser:
-    - La répartition des charges
-    - La sécurité du réseau
-    - L'expérience utilisateur
-    """
-}
+app.config.from_object(Config)
 
-Swagger(app, template={
-    "swagger": "2.0",
-    "info": {
-        "title": "API WiFi Optimus",
-        "version": "1.0",
-        "contact": {
-            "email": "support@wifioptimus.com"
+# Configuration Swagger sécurisée
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": 'apispec',
+            "route": '/apispec.json',
+            "rule_filter": lambda rule: True,
+            "model_filter": lambda tag: True,
         }
-    },
-    "consumes": [
-        "application/json"
     ],
-    "produces": [
-        "application/json"
-    ],
-    "definitions": {
-        "DonnesWifi": {
-            "type": "object",
-            "required": ["rssi", "snr", "user_type"],
-            "properties": {
-                "rssi": {"type": "number", "example": -68.5},
-                "snr": {"type": "number", "example": 22.3},
-                "session_duration": {"type": "integer", "example": 300},
-                "frequency": {"type": "number", "example": 5.0},
-                "channel": {"type": "integer", "example": 36},
-                "user_type": {
-                    "type": "string", 
-                    "enum": ["guest", "employee", "vip"],
-                    "example": "guest"
-                },
-                "device_os": {
-                    "type": "string",
-                    "enum": ["Android", "iOS", "Windows", "macOS"],
-                    "example": "Android"
-                },
-                "traffic_upload": {"type": "number", "example": 150.2},
-                "traffic_download": {"type": "number", "example": 450.7},
-                "latency": {"type": "number", "example": 45.1},
-                "packet_loss": {"type": "number", "example": 0.02}
-            }
-        },
-        "Prediction": {
-            "type": "object",
-            "properties": {
-                "decision": {
-                    "type": "string",
-                    "enum": ["switch_ap", "block_user", "load_balance", 
-                            "change_channel", "throttle", "no_action"],
-                    "example": "switch_ap"
-                },
-                "confidence": {"type": "number", "example": 0.92},
-                "model_version": {"type": "string", "example": "1.0.0"},
-                "timestamp": {"type": "string", "format": "date-time"}
-            }
+    "static_url_path": "/flasgger_static",
+    "swagger_ui": True,
+    "specs_route": "/docs/",
+    "securityDefinitions": {
+        "APIKeyHeader": {
+            "type": "apiKey",
+            "name": "X-API-KEY",
+            "in": "header"
         }
     }
+}
+
+Swagger(app, config=swagger_config, template={
+    "info": {
+        "title": "API WiFi Optimus",
+        "description": "API sécurisée pour la gestion intelligente des réseaux WiFi",
+        "contact": {
+            "email": "dotapok@gmail.com"
+        },
+        "version": "1.0.0"
+    },
+    "schemes": ["https"],
+    "security": [{"APIKeyHeader": []}]
 })
 
-class WiFiAIModel:
-    """Classe de gestion du modèle WiFi AI"""
-    
-    def __init__(self):
-        self.model = None
-        self.scaler = None
-        self.version = "1.0.0"
-        self.load_model()
+# Configuration du logging sécurisé
+handler = RotatingFileHandler(
+    Config.LOG_DIR / 'api.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s %(levelname)s [%(ip)s] %(message)s'
+))
+app.logger.addHandler(handler)
+app.logger.setLevel(logging.INFO)
 
-    def load_model(self):
-        """Charge le modèle et le scaler depuis les fichiers persistants"""
+class ModelLoader:
+    """Chargeur de modèle sécurisé avec vérification d'intégrité"""
+    
+    @staticmethod
+    def load_model():
         try:
-            model_path = CONFIG['MODEL_DIR'] / 'wifi_ai_pipeline.joblib'
-            pipeline = joblib.load(model_path)
-            
-            self.model = pipeline.named_steps['classifier']
-            self.scaler = pipeline.named_steps['preprocessor']
-            
-            app.logger.info(f"Modèle chargé (version {self.version})")
+            model_path = Config.MODEL_DIR / Config.MODEL_FILE
+            if not model_path.exists():
+                raise FileNotFoundError("Fichier modèle introuvable")
+                
+            # Vérification basique du fichier
+            if model_path.stat().st_size < 1024:  # 1KB minimum
+                raise ValueError("Fichier modèle corrompu")
+                
+            return joblib.load(model_path)
         except Exception as e:
             app.logger.error(f"Erreur de chargement du modèle: {str(e)}")
-            raise RuntimeError("Échec du chargement du modèle")
+            raise
 
-    def preprocess_input(self, input_data: Dict[str, Any]) -> pd.DataFrame:
-        """Transforme les données d'entrée en DataFrame formaté"""
-        required_fields = {
-            'rssi': float,
-            'snr': float,
-            'user_type': str,
-            'device_os': str,
-            'traffic_upload': float,
-            'traffic_download': float
+class APISecurity:
+    """Couche de sécurité pour les requêtes API"""
+    
+    @staticmethod
+    def validate_api_key(headers: Dict) -> bool:
+        api_key = headers.get('X-API-KEY')
+        valid_key = os.getenv('API_KEY')
+        return secrets.compare_digest(api_key, valid_key) if valid_key else False
+    
+    @staticmethod
+    def sanitize_input(data: Dict) -> Dict:
+        sanitized = {}
+        for k, v in data.items():
+            if isinstance(v, str):
+                sanitized[k] = v.strip()[:100]  # Limite à 100 caractères
+            else:
+                sanitized[k] = v
+        return sanitized
+
+class WiFiPredictor:
+    """Gestionnaire principal des prédictions"""
+    
+    def __init__(self):
+        self.pipeline = ModelLoader.load_model()
+        self.version = "1.0.0"
+        self.feature_names = self._get_feature_names()
+        
+    def _get_feature_names(self) -> list:
+        """Récupère les noms des features après prétraitement"""
+        try:
+            return self.pipeline.named_steps['preprocessor'].get_feature_names_out()
+        except Exception as e:
+            app.logger.error(f"Erreur feature names: {str(e)}")
+            return []
+    
+    def validate_input(self, data: Dict) -> Optional[str]:
+        """Valide les données d'entrée"""
+        required = {
+            'rssi': (float, -90, -30),
+            'snr': (float, 0, 40),
+            'user_type': (str, ['guest', 'employee', 'vip']),
+            'device_os': (str, ['Android', 'iOS', 'Windows', 'macOS']),
+            'traffic_upload': (float, 0, 10000),
+            'traffic_download': (float, 0, 10000)
         }
         
-        # Validation des champs obligatoires
-        for field, field_type in required_fields.items():
-            if field not in input_data:
-                raise ValueError(f"Champ manquant: {field}")
-            if not isinstance(input_data[field], field_type):
-                raise ValueError(f"Type invalide pour {field}")
+        for field, (field_type, *constraints) in required.items():
+            if field not in data:
+                return f"Champ manquant: {field}"
+                
+            if not isinstance(data[field], field_type):
+                return f"Type invalide pour {field}"
+                
+            if field_type == str and data[field] not in constraints[0]:
+                return f"Valeur invalide pour {field}"
+                
+            if field_type in (float, int) and not (constraints[0] <= data[field] <= constraints[1]):
+                return f"Valeur hors limites pour {field}"
         
-        return pd.DataFrame([input_data])
-
-    def predict(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Effectue une prédiction sur les données d'entrée"""
+        return None
+    
+    def predict(self, data: Dict) -> Dict:
+        """Effectue une prédiction sécurisée"""
         try:
-            # Préparation des données
-            input_df = self.preprocess_input(input_data)
+            # Validation et nettoyage
+            if error := self.validate_input(data):
+                raise ValueError(error)
+                
+            clean_data = APISecurity.sanitize_input(data)
             
-            # Transformation
-            input_processed = self.scaler.transform(input_df)
+            # Conversion en DataFrame
+            input_df = pd.DataFrame([clean_data])
             
             # Prédiction
-            prediction = self.model.predict(input_processed)[0]
-            confidence = np.max(self.model.predict_proba(input_processed))
+            prediction = self.pipeline.predict(input_df)[0]
+            proba = np.max(self.pipeline.predict_proba(input_df))
             
             return {
-                "decision": prediction,
-                "confidence": float(confidence),
+                "decision": str(prediction),
+                "confidence": float(proba),
                 "model_version": self.version,
-                "timestamp": pd.Timestamp.now().isoformat()
+                "timestamp": datetime.utcnow().isoformat() + "Z"
             }
             
         except Exception as e:
-            app.logger.error(f"Erreur de prédiction: {str(e)}")
-            raise RuntimeError("Échec de la prédiction")
+            app.logger.error(f"Erreur prédiction: {str(e)}")
+            raise
 
-# Initialisation du modèle
-wifi_model = WiFiAIModel()
+# Initialisation
+predictor = WiFiPredictor()
 
+# Middleware de sécurité
+@app.before_request
+def check_auth():
+    if request.path == '/health':
+        return
+        
+    if not APISecurity.validate_api_key(request.headers):
+        app.logger.warning(f"Accès non autorisé depuis {request.remote_addr}")
+        return jsonify({"error": "Accès non autorisé"}), 401
+
+# Endpoints
 @app.route('/prediction', methods=['POST'])
-def handle_prediction():
-    """
-    Endpoint principal de prédiction
-    ---
-    tags:
-      - Prédictions
-    """
+@swag_from({
+    'tags': ['Prédictions'],
+    'security': [{"APIKeyHeader": []}],
+    'parameters': [{
+        'name': 'body',
+        'in': 'body',
+        'required': True,
+        'schema': {
+            '$ref': '#/definitions/DonnesWifi'
+        }
+    }],
+    'responses': {
+        200: {
+            'description': 'Prédiction réussie',
+            'schema': {
+                '$ref': '#/definitions/Prediction'
+            }
+        },
+        400: {'description': 'Requête invalide'},
+        401: {'description': 'Non autorisé'},
+        500: {'description': 'Erreur serveur'}
+    }
+})
+def prediction_endpoint():
+    """Endpoint principal de prédiction"""
     try:
         data = request.get_json()
         if not data:
-            return jsonify({"error": "Aucune donnée fournie"}), 400
+            return jsonify({"error": "Données JSON requises"}), 400
             
-        result = wifi_model.predict(data)
+        result = predictor.predict(data)
+        app.logger.info(f"Prédiction réussie: {result['decision']}")
         return jsonify(result)
         
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 500
     except Exception as e:
-        app.logger.exception("Erreur inattendue")
-        return jsonify({"error": "Erreur interne du serveur"}), 500
+        app.logger.error(f"Erreur: {str(e)}")
+        return jsonify({"error": "Erreur de traitement"}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """
-    Endpoint de vérification de santé
-    ---
-    tags:
-      - Administration
-    responses:
-      200:
-        description: Statut du service
-    """
+    """Endpoint de vérification de santé"""
     return jsonify({
         "status": "healthy",
-        "model_version": wifi_model.version,
-        "service": "wifi-optimus-api"
+        "version": predictor.version,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
     })
 
 if __name__ == '__main__':
-    import logging
-    logging.basicConfig(
-        filename=CONFIG['LOG_DIR'] / 'api.log',
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
+    ssl_context = None
+    if os.path.exists('cert.pem') and os.path.exists('key.pem'):
+        ssl_context = ('cert.pem', 'key.pem')
     
     app.run(
         host='0.0.0.0',
-        port=5000,
-        debug=False  # Désactivé en production
+        port=int(os.getenv('PORT', 5000)),
+        ssl_context=ssl_context,
+        debug=os.getenv('DEBUG', 'false').lower() == 'true'
     )
